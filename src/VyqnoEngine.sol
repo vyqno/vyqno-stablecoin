@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {VyqnoStableCoin} from "./VyqnoStableCoin.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 contract VyqnoEngine is ReentrancyGuard {
@@ -19,11 +20,16 @@ contract VyqnoEngine is ReentrancyGuard {
     error VyqnoEngine__BurnFailed();
     error VyqnoEngine__HealthFactorOk();
     error VyqnoEngine__HealthFactorNotImproved();
+    error VyqnoEngine__LiquidationTooLarge();
+    error VyqnoEngine__OraclePriceInvalid();
+    error VyqnoEngine__OraclePriceStale();
 
     /*//////////////////////////////////////////////////////////////
                          STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
     mapping(address token => address priceFeed) private s_priceFeeds;
+    mapping(address token => uint256 heartbeat) private s_heartbeats;
+    mapping(address token => uint8 decimals) private s_tokenDecimals;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 VSCminted) private s_VSCminted;
     address[] private s_collateralTokens;
@@ -35,8 +41,10 @@ contract VyqnoEngine is ReentrancyGuard {
     uint256 private constant LIQUIDATION_THRESHOLD = 50; // 200% overcollateralized
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant LIQUIDATION_BONUS = 10; // 10% bonus for liquidators
+    uint256 private constant MAX_LIQUIDATION_PERCENTAGE = 50; // Can only liquidate 50% of user's debt
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
     uint256 private constant PRECISION = 1e18;
+    uint256 private constant DEFAULT_ORACLE_HEARTBEAT = 3600; // 1 hour default staleness tolerance
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -64,12 +72,23 @@ contract VyqnoEngine is ReentrancyGuard {
     /*//////////////////////////////////////////////////////////////
                                  CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
-    constructor(address[] memory allowedTokenAddresses, address[] memory priceFeedAddresses, address vscAddress) {
+    constructor(
+        address[] memory allowedTokenAddresses,
+        address[] memory priceFeedAddresses,
+        uint256[] memory heartbeats,
+        address vscAddress
+    ) {
         if (allowedTokenAddresses.length != priceFeedAddresses.length) {
+            revert VyqnoEngine__BothAddressLengthShouldBeEqual();
+        }
+        if (allowedTokenAddresses.length != heartbeats.length) {
             revert VyqnoEngine__BothAddressLengthShouldBeEqual();
         }
         for (uint256 i = 0; i < allowedTokenAddresses.length; i++) {
             s_priceFeeds[allowedTokenAddresses[i]] = priceFeedAddresses[i];
+            s_heartbeats[allowedTokenAddresses[i]] = heartbeats[i];
+            // Auto-detect token decimals using ERC20Metadata
+            s_tokenDecimals[allowedTokenAddresses[i]] = IERC20Metadata(allowedTokenAddresses[i]).decimals();
         }
         i_vyqnoStableCoin = VyqnoStableCoin(vscAddress);
         s_collateralTokens = allowedTokenAddresses;
@@ -84,11 +103,15 @@ contract VyqnoEngine is ReentrancyGuard {
         isAllowedToken(adressOfTokenWhichIsBeingDeposited)
         nonReentrant
     {
-        s_collateralDeposited[msg.sender][adressOfTokenWhichIsBeingDeposited] += amountOfTokenBeingDeposited;
-        emit CollateralDeposited(msg.sender, adressOfTokenWhichIsBeingDeposited, amountOfTokenBeingDeposited);
+        // Interaction before state update (protected by nonReentrant)
+        // This fail-fast approach saves gas if transfer fails
         bool success = IERC20(adressOfTokenWhichIsBeingDeposited)
             .transferFrom(msg.sender, address(this), amountOfTokenBeingDeposited);
         if (!success) revert VyqnoEngine__CollateralTransferFailed();
+
+        // Effects: Update state after successful transfer
+        s_collateralDeposited[msg.sender][adressOfTokenWhichIsBeingDeposited] += amountOfTokenBeingDeposited;
+        emit CollateralDeposited(msg.sender, adressOfTokenWhichIsBeingDeposited, amountOfTokenBeingDeposited);
     }
 
     /**
@@ -143,14 +166,18 @@ contract VyqnoEngine is ReentrancyGuard {
         uint256 amountCollateral,
         uint256 amountVscToMint
     ) external moreThanZero(amountCollateral) moreThanZero(amountVscToMint) nonReentrant {
-        s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
-        emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
-
+        // Interaction: Get collateral first (fail-fast, protected by nonReentrant)
         bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
         if (!success) revert VyqnoEngine__CollateralTransferFailed();
 
+        // Effects: Update state after successful collateral transfer
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
+        emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
+
         s_VSCminted[msg.sender] += amountVscToMint;
         _revertIfHealthFactorIsBroken(msg.sender);
+
+        // Final interaction: Mint VSC tokens
         i_vyqnoStableCoin.mint(msg.sender, amountVscToMint);
         emit VscMinted(msg.sender, amountVscToMint);
     }
@@ -194,6 +221,12 @@ contract VyqnoEngine is ReentrancyGuard {
         uint256 startingUserHealthFactor = _healthFactor(user);
         if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
             revert VyqnoEngine__HealthFactorOk();
+        }
+
+        // Enforce 50% liquidation cap to prevent repeated small liquidations
+        uint256 maxLiquidation = (s_VSCminted[user] * MAX_LIQUIDATION_PERCENTAGE) / LIQUIDATION_PRECISION;
+        if (debtToCover > maxLiquidation) {
+            revert VyqnoEngine__LiquidationTooLarge();
         }
 
         // Calculate how much collateral to give to the liquidator
@@ -273,12 +306,13 @@ contract VyqnoEngine is ReentrancyGuard {
      */
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        int256 price = _getValidatedPrice(priceFeed, s_heartbeats[token]);
+        uint8 tokenDecimals = s_tokenDecimals[token];
 
         // Price from Chainlink has 8 decimals
-        // We want everything in 18 decimals (wei)
-        // Formula: (amount * price * 1e10) / 1e18
-        return ((uint256(price) * 1e10) * amount) / 1e18;
+        // We want everything in 18 decimals (USD value)
+        // Formula: (amount * price * 1e10) / 10^tokenDecimals
+        return ((uint256(price) * 1e10) * amount) / (10 ** tokenDecimals);
     }
 
     /**
@@ -289,11 +323,12 @@ contract VyqnoEngine is ReentrancyGuard {
      */
     function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        int256 price = _getValidatedPrice(priceFeed, s_heartbeats[token]);
+        uint8 tokenDecimals = s_tokenDecimals[token];
 
-        // Price has 8 decimals, we need to convert it to 18 decimals
-        // Formula: (usdAmount * 1e18) / (price * 1e10)
-        return (usdAmountInWei * 1e18) / (uint256(price) * 1e10);
+        // Price has 8 decimals, USD amount in 18 decimals
+        // Formula: (usdAmount * 10^tokenDecimals) / (price * 1e10)
+        return (usdAmountInWei * (10 ** tokenDecimals)) / (uint256(price) * 1e10);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -319,6 +354,37 @@ contract VyqnoEngine is ReentrancyGuard {
     /*//////////////////////////////////////////////////////////////
                          INTERNAL VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Validates oracle price data from Chainlink
+     * @param priceFeed The Chainlink price feed
+     * @param heartbeat Maximum acceptable staleness in seconds
+     * @return price The validated price
+     */
+    function _getValidatedPrice(AggregatorV3Interface priceFeed, uint256 heartbeat)
+        internal
+        view
+        returns (int256 price)
+    {
+        (uint80 roundId, int256 answer, , uint256 updatedAt, uint80 answeredInRound) = priceFeed.latestRoundData();
+
+        // Check if price is valid (not zero or negative)
+        if (answer <= 0) {
+            revert VyqnoEngine__OraclePriceInvalid();
+        }
+
+        // Check if price is stale
+        if (block.timestamp - updatedAt > heartbeat) {
+            revert VyqnoEngine__OraclePriceStale();
+        }
+
+        // Check if round is complete
+        if (answeredInRound < roundId) {
+            revert VyqnoEngine__OraclePriceStale();
+        }
+
+        return answer;
+    }
 
     /**
      * @notice Checks if user's health factor is safe
