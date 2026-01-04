@@ -9,23 +9,44 @@ all: clean install update build test
 
 # Help target
 help:
-	@echo "Available targets:"
-	@echo "  install        - Install dependencies"
-	@echo "  update         - Update dependencies"
-	@echo "  build          - Build contracts"
-	@echo "  test           - Run all tests"
-	@echo "  test-unit      - Run unit tests only"
-	@echo "  test-fuzz      - Run fuzz tests"
-	@echo "  test-invariant - Run invariant tests"
-	@echo "  coverage       - Generate test coverage report"
-	@echo "  snapshot       - Generate gas snapshot"
-	@echo "  format         - Format code with forge fmt"
-	@echo "  clean          - Clean build artifacts"
-	@echo "  anvil          - Start local Anvil node"
-	@echo "  deploy-anvil   - Deploy to local Anvil"
-	@echo "  deploy-sepolia - Deploy to Sepolia testnet"
-	@echo "  deploy-polygon - Deploy to Polygon mainnet"
-	@echo "  deploy-arbitrum- Deploy to Arbitrum mainnet"
+	@echo "Vyqno Stablecoin Protocol - Available Commands"
+	@echo "=============================================="
+	@echo ""
+	@echo "Build & Setup:"
+	@echo "  make install        - Install dependencies"
+	@echo "  make update         - Update dependencies"
+	@echo "  make build          - Build contracts"
+	@echo "  make clean          - Clean build artifacts"
+	@echo "  make format         - Format code with forge fmt"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test           - Run all tests"
+	@echo "  make test-unit      - Run unit tests only"
+	@echo "  make test-fuzz      - Run fuzz tests"
+	@echo "  make test-invariant - Run invariant tests"
+	@echo "  make test-integration - Run integration tests"
+	@echo "  make test-advanced  - Run advanced edge case tests"
+	@echo "  make test-gas       - Run tests with gas reporting"
+	@echo "  make test-quick     - Run quick unit tests"
+	@echo ""
+	@echo "Coverage & Analysis:"
+	@echo "  make coverage       - Generate coverage report"
+	@echo "  make coverage-html  - Generate HTML coverage report"
+	@echo "  make snapshot       - Generate gas snapshot"
+	@echo "  make snapshot-diff  - Compare gas snapshots"
+	@echo "  make slither        - Run Slither static analysis"
+	@echo ""
+	@echo "Deployment:"
+	@echo "  make anvil          - Start local Anvil node"
+	@echo "  make deploy-anvil   - Deploy to local Anvil"
+	@echo "  make deploy-sepolia - Deploy to Sepolia testnet"
+	@echo "  make deploy-polygon - Deploy to Polygon mainnet (with confirmation)"
+	@echo "  make deploy-arbitrum - Deploy to Arbitrum mainnet (with confirmation)"
+	@echo ""
+	@echo "Verification:"
+	@echo "  make verify-sepolia CONTRACT=<address>"
+	@echo "  make verify-polygon CONTRACT=<address>"
+	@echo "  make verify-arbitrum CONTRACT=<address>"
 
 # Installation and setup
 install:
@@ -54,11 +75,38 @@ test-fuzz:
 test-invariant:
 	forge test --match-path "test/invariant/**/*.sol" -vv
 
+test-integration:
+	@echo "Running integration tests..."
+	forge test --match-path "test/integration/**/*.sol" -vv
+
+test-advanced:
+	@echo "Running advanced edge case tests..."
+	forge test --match-path "test/unit/VyqnoEngineAdvanced.t.sol" -vvv
+
+test-gas:
+	@echo "Running tests with gas reporting..."
+	forge test --gas-report
+
+test-quick:
+	@echo "Running quick unit tests (no fuzz/invariant)..."
+	forge test --match-path "test/unit/VyqnoEngineTest.t.sol" -vv --no-match-contract "Fuzz|Invariant"
+
 coverage:
+	@echo "Generating coverage report..."
 	forge coverage --report summary --report lcov
+
+coverage-html:
+	@echo "Generating HTML coverage report..."
+	@forge coverage --report lcov
+	@genhtml lcov.info --output-directory coverage --branch-coverage --function-coverage || echo "Install genhtml: brew install lcov or apt-get install lcov"
+	@echo "Coverage report generated in ./coverage/index.html"
 
 snapshot:
 	forge snapshot
+
+snapshot-diff:
+	@echo "Comparing gas snapshots..."
+	forge snapshot --diff
 
 # Code formatting
 format:

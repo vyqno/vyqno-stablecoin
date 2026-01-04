@@ -1,25 +1,41 @@
-name: CI
+name: Vyqno Stablecoin CI/CD
 
-permissions: {}
+permissions:
+  contents: read
+  pull-requests: write
 
 on:
   push:
+    branches: [main, develop]
   pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 env:
   FOUNDRY_PROFILE: ci
 
 jobs:
-  check:
-    name: Foundry project
+  lint:
+    name: Code Formatting
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v5
         with:
-          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run Forge fmt check
+        run: forge fmt --check
+
+  build:
+    name: Build & Size Check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+        with:
           submodules: recursive
 
       - name: Install Foundry
@@ -28,11 +44,218 @@ jobs:
       - name: Show Forge version
         run: forge --version
 
-      - name: Run Forge fmt
-        run: forge fmt --check
-
-      - name: Run Forge build
+      - name: Build contracts
         run: forge build --sizes
 
-      - name: Run Forge tests
-        run: forge test -vvv
+      - name: Check contract sizes
+        run: |
+          echo "Contract sizes:"
+          forge build --sizes | tee contract-sizes.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            out/
+            contract-sizes.txt
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run unit tests
+        run: forge test --match-path "test/unit/**/*.sol" -vvv
+
+  test-fuzz:
+    name: Fuzz Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run fuzz tests
+        run: forge test --match-path "test/fuzz/**/*.sol" -vvv
+
+  test-invariant:
+    name: Invariant Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run invariant tests
+        run: forge test --match-path "test/invariant/**/*.sol" -vvv
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Run integration tests
+        run: forge test --match-path "test/integration/**/*.sol" -vvv
+
+  coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-fuzz, test-invariant, test-integration]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install lcov
+        run: sudo apt-get install -y lcov
+
+      - name: Generate coverage report
+        run: forge coverage --report lcov
+
+      - name: Generate HTML coverage report
+        run: genhtml lcov.info --output-directory coverage --branch-coverage --function-coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: Coverage summary
+        run: |
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          forge coverage --report summary >> $GITHUB_STEP_SUMMARY
+
+  gas-report:
+    name: Gas Report
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Generate gas report
+        run: forge test --gas-report | tee gas-report.txt
+
+      - name: Upload gas report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gas-report
+          path: gas-report.txt
+
+      - name: Gas report summary
+        run: |
+          echo "## Gas Report" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat gas-report.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  gas-snapshot:
+    name: Gas Snapshot
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Create gas snapshot
+        run: forge snapshot
+
+      - name: Compare gas snapshot
+        if: github.event_name == 'pull_request'
+        run: |
+          forge snapshot --diff || true
+
+      - name: Upload gas snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: gas-snapshot
+          path: .gas-snapshot
+
+  security:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    needs: build
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Slither
+        run: pip install slither-analyzer
+
+      - name: Run Slither
+        run: slither . --json slither-report.json || true
+
+      - name: Upload Slither report
+        uses: actions/upload-artifact@v4
+        with:
+          name: slither-report
+          path: slither-report.json
+
+  all-tests-passed:
+    name: All Tests Passed
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [lint, build, test-unit, test-fuzz, test-invariant, test-integration, coverage, gas-report]
+    steps:
+      - name: Check test results
+        run: |
+          if [[ "${{ needs.lint.result }}" == "success" && \
+                "${{ needs.build.result }}" == "success" && \
+                "${{ needs.test-unit.result }}" == "success" && \
+                "${{ needs.test-fuzz.result }}" == "success" && \
+                "${{ needs.test-invariant.result }}" == "success" && \
+                "${{ needs.test-integration.result }}" == "success" && \
+                "${{ needs.coverage.result }}" == "success" && \
+                "${{ needs.gas-report.result }}" == "success" ]]; then
+            echo "✅ All tests passed successfully!"
+            exit 0
+          else
+            echo "❌ Some tests failed"
+            exit 1
+          fi
